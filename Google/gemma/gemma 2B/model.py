@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import json
 from tokenizers import Tokenizer
 from torch.utils.data import Dataset, DataLoader
 
@@ -78,34 +79,28 @@ def apply_rope(x, cos, sin):
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(
-            self,
-            num_heads,
-            kv_head, 
-            attention_dropout,
-            d_in,
-            d_out, 
-            head_dim,
-            bias_qkv,
-        ):
-        
+    def __init__(self, cfg):
         super().__init__()
-        
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.kv_head = kv_head
-        
-        self.d_in = d_in
-        self.d_out = d_out
-        
-        self.attention_dropout = attention_dropout
-        
-        self.W_q = nn.Linear(d_in, num_heads * self.head_dim, bias=bias_qkv)
-        self.W_k = nn.Linear(d_in, kv_head * self.head_dim, bias=bias_qkv)
-        self.W_v = nn.Linear(d_in, kv_head * self.head_dim, bias=bias_qkv)
-        
-        self.out_proj = nn.Linear(num_heads * self.head_dim, d_out, bias=bias_qkv)
-        
+
+        self.num_heads = cfg["num_attention_heads"]
+        self.num_key_value_heads = cfg["num_key_value_heads"]
+        self.head_dim = cfg["head_dim"]
+
+        if self.num_heads % self.num_key_value_heads != 0:
+            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
+
+        d_in = cfg["hidden_size"]
+        d_out = cfg["hidden_size"]
+
+        self.attention_dropout = cfg["attention_dropout"]
+
+        bias = cfg["attention_bias"]
+        self.W_q = nn.Linear(d_in, self.num_heads * self.head_dim, bias=bias)
+        self.W_k = nn.Linear(d_in, self.num_key_value_heads * self.head_dim, bias=bias)
+        self.W_v = nn.Linear(d_in, self.num_key_value_heads * self.head_dim, bias=bias)
+
+        self.out_proj = nn.Linear(self.num_heads * self.head_dim, d_out, bias=bias)
+
     def forward(self,x,cos,sin):
         batch_size,num_tokens,d_in = x.shape
         
@@ -114,8 +109,8 @@ class GroupedQueryAttention(nn.Module):
         V = self.W_v(x)
         
         Q = Q.view(batch_size,num_tokens,self.num_heads,self.head_dim)
-        K = K.view(batch_size,num_tokens,self.kv_head,self.head_dim)
-        V = V.view(batch_size,num_tokens,self.kv_head,self.head_dim)
+        K = K.view(batch_size,num_tokens,self.num_key_value_heads,self.head_dim)
+        V = V.view(batch_size,num_tokens,self.num_key_value_heads,self.head_dim)
         
         Q = Q.transpose(1, 2)
         K = K.transpose(1, 2)
@@ -196,82 +191,71 @@ class RMSNorm(nn.Module):
         return (x_float * (1.0 + self.weight.float())).to(x.dtype)
 
 
-class TransformerBlock(nn.Module):  
+class TransformerBlock(nn.Module):
     def __init__(self,cfg):
         super().__init__()
-        
-        self.attn = GroupedQueryAttention(
-            num_heads = cfg['num_heads'],
-            kv_head = cfg['kv_head'],
-            d_in = cfg['emb_dim'],
-            d_out = cfg['emb_dim'],
-            bias_qkv = cfg['bias_qkv'],
-            head_dim = cfg['head_dim'],
-            attention_dropout=cfg["attention_dropout"]
-        )
-        
-        self.layer1 = RMSNorm(cfg['emb_dim'],eps=cfg["rms_norm_eps"])
-        self.layer2 = RMSNorm(cfg['emb_dim'],eps=cfg["rms_norm_eps"])
-        
-        self.ffn = FeedForward(cfg['emb_dim'],hidden_dim = cfg['intermediate_size'],activation = cfg['hidden_activation'])
-        
-        self.resid_dropout = nn.Dropout(cfg["resid_dropout"])
-        
+
+        emb_dim = cfg["hidden_size"]
+        eps = cfg["rms_norm_eps"]
+
+        self.attn = GroupedQueryAttention(cfg)
+
+        self.layer1 = RMSNorm(emb_dim, eps)
+        self.layer2 = RMSNorm(emb_dim, eps)
+
+        self.ffn = FeedForward(emb_dim, cfg["intermediate_size"], cfg["hidden_activation"])
+
     def forward(self,x,cos,sin):
         shortcut = x
         x = self.layer1(x)
         x = self.attn(x,cos,sin)
-        x = self.resid_dropout(x)
         x = x + shortcut
         
         shortcut = x
         x = self.layer2(x)
         x = self.ffn(x)
-        x = self.resid_dropout(x)
         x = x + shortcut
         
         return x
     
 class Model(nn.Module):
-    
+
     def __init__(self,cfg):
         super().__init__()
-        
-        self.tok_emb = nn.Embedding(cfg["vocab_size"],cfg["emb_dim"])
-        self.embd_dropout = nn.Dropout(cfg["embd_dropout"])
-        
+
+        self.tok_emb = nn.Embedding(cfg["vocab_size"],cfg["hidden_size"])
+
         self.blocks = nn.ModuleList(
-            [TransformerBlock(cfg) for _ in range(cfg["num_layers"])]
+            [TransformerBlock(cfg) for _ in range(cfg["num_hidden_layers"])]
         )
-        
-        self.out_norm_layer = RMSNorm(cfg["emb_dim"],eps=cfg["rms_norm_eps"])
-        self.out_proj = nn.Linear(cfg["emb_dim"],cfg["vocab_size"],bias=False)
 
-        if cfg["tie_word_embeddings"]:
-            self.out_proj.weight = self.tok_emb.weight
+        self.out_norm_layer = RMSNorm(cfg["hidden_size"],eps=cfg["rms_norm_eps"])
+        self.out_proj = nn.Linear(cfg["hidden_size"],cfg["vocab_size"],bias=False)
 
-        # Gemma scales the token embeddings by sqrt(emb_dim)
-        self.emb_scale = cfg["emb_dim"] ** 0.5
+        # Gemma ties the output head to the token embedding
+        self.out_proj.weight = self.tok_emb.weight
+
+        # Gemma scales the token embeddings by sqrt(hidden_size)
+        self.emb_scale = cfg["hidden_size"] ** 0.5
 
         # One RoPE table shared by every layer
         head_dim = cfg["head_dim"]
         cos, sin = compute_rope_params(
-            head_dim, cfg["rope_base"], cfg["context_length"]
+            head_dim, cfg["rope_theta"], cfg["max_position_embeddings"]
         )
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
-        
+
     def forward(self,idx):
         batch_size,num_tokens = idx.shape
         
         if num_tokens > self.cos.size(0):
             raise ValueError(
                 f"Sequence length {num_tokens} exceeds "
-                f"context_length {self.cos.size(0)}"
+                f"max_position_embeddings {self.cos.size(0)}"
             )
 
-        token_embedding = self.tok_emb(idx) * self.emb_scale
-        x = self.embd_dropout(token_embedding)
+        x = self.tok_emb(idx) * self.emb_scale
         
         for block in self.blocks:
             x = block(x, self.cos, self.sin)
@@ -303,25 +287,13 @@ def generate_text_simple(model, idx, max_new_tokens, context_size):
     return idx
     
 def main():
-    cfg = {
-        "vocab_size": 256000,
-        "emb_dim": 2048,
-        "intermediate_size" : 16384,
-        "context_length": 8192,
-        "num_heads": 8,
-        "head_dim": 256,
-        "kv_head": 1,
-        "num_layers": 18,
-        "attention_dropout": 0.0,
-        "resid_dropout": 0.0,
-        "embd_dropout": 0.0,
-        "bias_qkv": False,
-        "rope_base": 10000.0,
-        "rms_norm_eps": 1e-06,
-        "tie_word_embeddings": True,
-        "hidden_activation": "gelu_pytorch_tanh",
-    }
-    
+
+    with open("config.json") as f:
+        cfg = json.load(f)
+
+    # config.json lists hidden_act "gelu", but Gemma uses the tanh-approximate GELU
+    cfg.setdefault("hidden_activation", "gelu_pytorch_tanh")
+
     torch.manual_seed(42)
     model = Model(cfg)
     model.eval()
@@ -348,7 +320,7 @@ def main():
             model=model,
             idx=encoded_tensor,
             max_new_tokens=10,
-            context_size=cfg["context_length"]
+            context_size=cfg["max_position_embeddings"]
         )
     decoded_text = tokenizer.decode(out.squeeze(0).tolist())
 
