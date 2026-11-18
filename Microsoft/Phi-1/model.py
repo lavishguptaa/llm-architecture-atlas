@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import json
 from tokenizers import Tokenizer
 from torch.utils.data import Dataset, DataLoader
 
@@ -104,26 +105,31 @@ def apply_rope(x, cos, sin):
 
 
 class MultiHeadAttention(nn.Module):
-    
-    def __init__(self,num_heads,d_in,d_out,context_length,attention_dropout,bias_qkv):
+
+    def __init__(self,cfg):
         super().__init__()
-        
-        assert d_in % num_heads == 0, "d_in must be divisible by num_heads"
-        
-        self.num_heads = num_heads
-        self.head_dim = d_in // num_heads
+
+        d_in = cfg["hidden_size"]
+        d_out = cfg["hidden_size"]
+        context_length = cfg["max_position_embeddings"]
+
+        assert d_in % cfg["num_attention_heads"] == 0, "hidden_size must be divisible by num_attention_heads"
+
+        self.num_heads = cfg["num_attention_heads"]
+        self.head_dim = d_in // self.num_heads
         self.d_out = d_out
-        
-        self.W_q = nn.Linear(d_in,d_out,bias=bias_qkv)
-        self.W_k = nn.Linear(d_in,d_out,bias=bias_qkv)
-        self.W_v = nn.Linear(d_in,d_out,bias=bias_qkv)
-        
-        
+
+        # PhiAttention always puts a bias on the q / k / v projections
+        self.W_q = nn.Linear(d_in,d_out,bias=True)
+        self.W_k = nn.Linear(d_in,d_out,bias=True)
+        self.W_v = nn.Linear(d_in,d_out,bias=True)
+
+
         self.out_proj = nn.Linear(d_out,d_out)
-        self.attention_dropout = nn.Dropout(attention_dropout)
-        
+        self.attention_dropout = nn.Dropout(cfg["attention_dropout"])
+
         self.register_buffer("mask",torch.triu(torch.ones(context_length,context_length),diagonal=1).bool())
-        
+
     def forward(self,x,cos,sin):
         batch_size,num_tokens,d_in = x.shape
         
@@ -178,21 +184,14 @@ class TransformerBlock(nn.Module):
     def __init__(self,cfg):
         super().__init__()
         
-        self.attn = MultiHeadAttention(
-            num_heads = cfg['num_heads'],
-            d_in = cfg['emb_dim'],
-            d_out = cfg['emb_dim'],
-            context_length = cfg['context_length'],
-            attention_dropout = cfg['attention_dropout'],
-            bias_qkv = cfg['bias_qkv']
-        )
+        self.attn = MultiHeadAttention(cfg)
         
         self.layer1 = LayerNorm(
-            cfg["emb_dim"],
+            cfg["hidden_size"],
             cfg["layer_norm_eps"]
         )
         
-        self.ffn = FeedForward(cfg['emb_dim'],cfg['intermediate_size'])
+        self.ffn = FeedForward(cfg["hidden_size"],cfg['intermediate_size'])
         
         
     def forward(self,x,cos,sin):
@@ -208,27 +207,27 @@ class Model(nn.Module):
     def __init__(self,cfg):
         super().__init__()
         
-        self.tok_emb = nn.Embedding(cfg["vocab_size"],cfg["emb_dim"])
+        self.tok_emb = nn.Embedding(cfg["vocab_size"],cfg["hidden_size"])
         
         self.blocks = nn.ModuleList(
-            [TransformerBlock(cfg) for _ in range(cfg["num_layers"])]
+            [TransformerBlock(cfg) for _ in range(cfg["num_hidden_layers"])]
         )
         
         self.out_norm_layer = LayerNorm(
-            cfg["emb_dim"],
+            cfg["hidden_size"],
             cfg["layer_norm_eps"]
         )
 
         # One RoPE table shared by every layer; only the first rotary_dim dims of each head are rotated
-        head_dim = cfg["emb_dim"] // cfg["num_heads"]
+        head_dim = cfg["hidden_size"] // cfg["num_attention_heads"]
         rotary_dim = int(head_dim * cfg["partial_rotary_factor"])
         cos, sin = compute_rope_params(
-            rotary_dim, cfg["rope_theta"], cfg["context_length"]
+            rotary_dim, cfg["rope_theta"], cfg["max_position_embeddings"]
         )
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
         
-        self.out_proj = nn.Linear(cfg["emb_dim"],cfg["vocab_size"])
+        self.out_proj = nn.Linear(cfg["hidden_size"],cfg["vocab_size"])
         
     def forward(self,idx):
         batch_size,num_tokens = idx.shape
@@ -236,7 +235,7 @@ class Model(nn.Module):
         if num_tokens > self.cos.size(0):
             raise ValueError(
                 f"Sequence length {num_tokens} exceeds "
-                f"context_length {self.cos.size(0)}"
+                f"max_position_embeddings {self.cos.size(0)}"
             )
 
         token_embedding = self.tok_emb(idx)
@@ -273,21 +272,10 @@ def generate_text_simple(model, idx, max_new_tokens, context_size):
     return idx
     
 def main():
-    cfg = {
-        "vocab_size": 51200,
-        "emb_dim": 2048,
-        "intermediate_size": 8192,
-        "context_length": 2048,
-        "num_heads": 32,
-        "num_layers": 24,
-        "bias_qkv": True,       # PhiAttention always puts a bias on the q / k / v projections
-        "layer_norm_eps": 1e-5,
-        "attention_dropout": 0.0,
-        "rope_theta": 10000.0,
-        "partial_rotary_factor": 0.5,
-        "hidden_act": "gelu_new"
-    }
-    
+
+    with open("config.json") as f:
+        cfg = json.load(f)
+
     torch.manual_seed(42)
     model = Model(cfg)
     model.eval()
@@ -314,7 +302,7 @@ def main():
             model=model,
             idx=encoded_tensor,
             max_new_tokens=10,
-            context_size=cfg["context_length"]
+            context_size=cfg["max_position_embeddings"]
         )
     decoded_text = tokenizer.decode(out.squeeze(0).tolist())
 

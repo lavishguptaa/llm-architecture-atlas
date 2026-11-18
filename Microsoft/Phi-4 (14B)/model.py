@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import json
 from tokenizers import Tokenizer
 from torch.utils.data import Dataset, DataLoader
 
@@ -79,34 +80,30 @@ def apply_rope(x, cos, sin):
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(
-            self,
-            num_heads,
-            kv_head, 
-            attention_dropout,
-            d_in,
-            d_out, 
-            bias_qkv,
-        ):
-        
+    def __init__(self, cfg):
         super().__init__()
-        assert d_in % num_heads == 0, "d_in must be divisible by num_heads"
-        
-        self.num_heads = num_heads
-        self.head_dim = d_in // num_heads
-        self.kv_head = kv_head
-        
+
+        d_in = cfg["hidden_size"]
+        d_out = cfg["hidden_size"]
+
+        assert d_in % cfg["num_attention_heads"] == 0, "hidden_size must be divisible by num_attention_heads"
+
+        self.num_heads = cfg["num_attention_heads"]
+        self.head_dim = d_in // self.num_heads
+        self.num_key_value_heads = cfg["num_key_value_heads"]
+
         self.d_in = d_in
         self.d_out = d_out
-        
-        self.attention_dropout = attention_dropout
-        
-        self.W_q = nn.Linear(d_in, num_heads * self.head_dim, bias=bias_qkv)
-        self.W_k = nn.Linear(d_in, kv_head * self.head_dim, bias=bias_qkv)
-        self.W_v = nn.Linear(d_in, kv_head * self.head_dim, bias=bias_qkv)
-        
-        self.out_proj = nn.Linear(d_in, d_out,bias=bias_qkv)
-        
+
+        self.attention_dropout = cfg["attention_dropout"]
+
+        bias = cfg["attention_bias"]
+        self.W_q = nn.Linear(d_in, self.num_heads * self.head_dim, bias=bias)
+        self.W_k = nn.Linear(d_in, self.num_key_value_heads * self.head_dim, bias=bias)
+        self.W_v = nn.Linear(d_in, self.num_key_value_heads * self.head_dim, bias=bias)
+
+        self.out_proj = nn.Linear(d_in, d_out, bias=bias)
+
     def forward(self,x,cos,sin):
         batch_size,num_tokens,d_in = x.shape
         
@@ -115,8 +112,8 @@ class GroupedQueryAttention(nn.Module):
         V = self.W_v(x)
         
         Q = Q.view(batch_size,num_tokens,self.num_heads,self.head_dim)
-        K = K.view(batch_size,num_tokens,self.kv_head,self.head_dim)
-        V = V.view(batch_size,num_tokens,self.kv_head,self.head_dim)
+        K = K.view(batch_size,num_tokens,self.num_key_value_heads,self.head_dim)
+        V = V.view(batch_size,num_tokens,self.num_key_value_heads,self.head_dim)
         
         Q = Q.transpose(1, 2)
         K = K.transpose(1, 2)
@@ -192,21 +189,14 @@ class TransformerBlock(nn.Module):
     def __init__(self,cfg):
         super().__init__()
         
-        self.attn = GroupedQueryAttention(
-            num_heads = cfg['num_heads'],
-            kv_head = cfg['kv_head'],
-            d_in = cfg['emb_dim'],
-            d_out = cfg['emb_dim'],
-            bias_qkv = cfg['bias_qkv'],
-           attention_dropout=cfg["attention_dropout"]
-        )
+        self.attn = GroupedQueryAttention(cfg)
         
-        self.layer1 = RMSNorm(cfg['emb_dim'],eps=cfg["rms_norm_eps"])
-        self.layer2 = RMSNorm(cfg['emb_dim'],eps=cfg["rms_norm_eps"])
+        self.layer1 = RMSNorm(cfg["hidden_size"],eps=cfg["rms_norm_eps"])
+        self.layer2 = RMSNorm(cfg["hidden_size"],eps=cfg["rms_norm_eps"])
         
-        self.ffn = FeedForward(cfg['emb_dim'],hidden_dim = cfg['intermediate_size'])
+        self.ffn = FeedForward(cfg["hidden_size"],hidden_dim = cfg['intermediate_size'])
         
-        self.resid_dropout = nn.Dropout(cfg["resid_dropout"])
+        self.resid_dropout = nn.Dropout(cfg["resid_pdrop"])
         
     def forward(self,x,cos,sin):
         shortcut = x
@@ -228,20 +218,20 @@ class Model(nn.Module):
     def __init__(self,cfg):
         super().__init__()
         
-        self.tok_emb = nn.Embedding(cfg["vocab_size"],cfg["emb_dim"])
-        self.embd_dropout = nn.Dropout(cfg["embd_dropout"])
+        self.tok_emb = nn.Embedding(cfg["vocab_size"],cfg["hidden_size"])
+        self.embd_dropout = nn.Dropout(cfg["embd_pdrop"])
         
         self.blocks = nn.ModuleList(
-            [TransformerBlock(cfg) for _ in range(cfg["num_layers"])]
+            [TransformerBlock(cfg) for _ in range(cfg["num_hidden_layers"])]
         )
         
-        self.out_norm_layer = RMSNorm(cfg["emb_dim"],eps=cfg["rms_norm_eps"])
-        self.out_proj = nn.Linear(cfg["emb_dim"],cfg["vocab_size"],bias=False)
+        self.out_norm_layer = RMSNorm(cfg["hidden_size"],eps=cfg["rms_norm_eps"])
+        self.out_proj = nn.Linear(cfg["hidden_size"],cfg["vocab_size"],bias=False)
 
         # One RoPE table shared by every layer
-        head_dim = cfg["emb_dim"] // cfg["num_heads"]
+        head_dim = cfg["hidden_size"] // cfg["num_attention_heads"]
         cos, sin = compute_rope_params(
-            head_dim, cfg["rope_base"], cfg["context_length"]
+            head_dim, cfg["rope_theta"], cfg["max_position_embeddings"]
         )
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
@@ -252,7 +242,7 @@ class Model(nn.Module):
         if idx.size(1) > self.cos.size(0):
             raise ValueError(
                 f"Sequence length {idx.size(1)} exceeds "
-                f"context_length {self.cos.size(0)}"
+                f"max_position_embeddings {self.cos.size(0)}"
             )
 
         token_embedding = self.tok_emb(idx)
@@ -288,22 +278,10 @@ def generate_text_simple(model, idx, max_new_tokens, context_size):
     return idx
     
 def main():
-    cfg = {
-        "vocab_size": 100352,
-        "emb_dim": 5120,
-        "intermediate_size" : 17920,
-        "context_length": 16384,
-        "num_heads": 40,
-        "kv_head": 10,
-        "num_layers": 40,
-        "attention_dropout": 0.0,
-        "resid_dropout": 0.0,
-        "embd_dropout": 0.0,
-        "bias_qkv": False,
-        "rope_base": 250000,
-        "rms_norm_eps": 1e-5,
-    }
-    
+
+    with open("config.json") as f:
+        cfg = json.load(f)
+
     torch.manual_seed(42)
     model = Model(cfg)
     model.eval()
@@ -330,7 +308,7 @@ def main():
             model=model,
             idx=encoded_tensor,
             max_new_tokens=10,
-            context_size=cfg["context_length"]
+            context_size=cfg["max_position_embeddings"]
         )
     decoded_text = tokenizer.decode(out.squeeze(0).tolist())
 
