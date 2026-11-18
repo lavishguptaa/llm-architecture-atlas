@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import json
 from tokenizers import Tokenizer
 
 
@@ -323,27 +324,25 @@ def generate_text_simple(model, idx, max_new_tokens, context_size):
 
 
 def main():
-    # The Hugging Face config.json is a multimodal wrapper that only lists the
-    # non-default text settings, so the full text-model config is spelled out here
-    cfg = {
-        "vocab_size": 262208,
-        "hidden_size": 5376,
-        "intermediate_size": 21504,
-        "num_hidden_layers": 62,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 16,
-        "head_dim": 128,
-        "max_position_embeddings": 131072,
-        "rms_norm_eps": 1e-06,
-        "rope_theta": 1000000.0,
-        "rope_local_base_freq": 10000.0,
-        "rope_scaling": {"factor": 8.0, "rope_type": "linear"},
-        "attention_bias": False,
-        "attention_dropout": 0.0,
-        "query_pre_attn_scalar": 168,
-        "sliding_window": 1024,
-        "sliding_window_pattern": 6
-    }
+
+    # The checkpoint config is multimodal: the language model's settings sit under "text_config"
+    with open("config.json") as f:
+        cfg = json.load(f)["text_config"]
+
+    # These settings are not listed in config.json (it only lists what differs from the standard
+    # Gemma 3 text model); they are the defaults of the Hugging Face Gemma3TextConfig
+    cfg.setdefault("vocab_size", 262208)
+    cfg.setdefault("num_attention_heads", 8)
+    cfg.setdefault("num_key_value_heads", 4)
+    cfg.setdefault("head_dim", 256)
+    cfg.setdefault("max_position_embeddings", 131072)
+    cfg.setdefault("rms_norm_eps", 1e-06)
+    cfg.setdefault("rope_theta", 1000000.0)
+    cfg.setdefault("rope_local_base_freq", 10000.0)
+    cfg.setdefault("attention_bias", False)
+    cfg.setdefault("attention_dropout", 0.0)
+    cfg.setdefault("query_pre_attn_scalar", 256)
+    cfg.setdefault("sliding_window_pattern", 6)
 
     torch.manual_seed(42)
     model = Model(cfg)
